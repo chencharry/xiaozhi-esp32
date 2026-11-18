@@ -6,10 +6,12 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
-#include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 
+#include <atomic>
+#include <driver/gpio.h>
+#include <esp_err.h>
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
@@ -27,6 +29,7 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    std::atomic<bool> light_on_{false};
 
     void InitializeDisplayI2c() {
         i2c_master_bus_config_t bus_config = {
@@ -149,9 +152,57 @@ private:
         });
     }
 
+    void InitializeLight() {
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pin_bit_mask = 1ULL << static_cast<int>(LIGHT_GPIO);
+        io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+        // 默认关灯：GPIO18 输出低电平
+        light_on_.store(false);
+        ESP_ERROR_CHECK(gpio_set_level(LIGHT_GPIO, 0));
+        ESP_LOGI(TAG, "Light initialized: GPIO%d, default OFF (low level)",
+                 static_cast<int>(LIGHT_GPIO));
+    }
+
+    bool SetLight(bool on, const char* source) {
+        light_on_.store(on);
+        esp_err_t err = gpio_set_level(LIGHT_GPIO, on ? 1 : 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set light GPIO%d level=%d: %s",
+                     static_cast<int>(LIGHT_GPIO), on ? 1 : 0, esp_err_to_name(err));
+            return false;
+        }
+        ESP_LOGI(TAG, "Light %s: GPIO%d level=%d, source=%s", on ? "ON" : "OFF",
+                 static_cast<int>(LIGHT_GPIO), on ? 1 : 0, source);
+        return true;
+    }
+
     // 物联网初始化，添加对 AI 可见设备
     void InitializeTools() {
-        static LampController lamp(LAMP_GPIO);
+        auto& mcp_server = McpServer::GetInstance();
+
+        // 语音开灯/关灯：LLM 调用 self.light.set，on=true 开灯，on=false 关灯
+        mcp_server.AddTool(
+            "self.light.set",
+            "打开或关闭设备上的灯。on=true 开灯，on=false 关灯。",
+            PropertyList({Property("on", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool on = properties["on"].value<bool>();
+                bool success = SetLight(on, "voice/mcp");
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddBoolToObject(result, "success", success);
+                cJSON_AddBoolToObject(result, "light_on", on);
+                return result;
+            });
+
+        mcp_server.AddTool("self.light.get", "查询设备上的灯当前是开还是关。", PropertyList(),
+                           [this](const PropertyList&) -> ReturnValue {
+                               return std::string(light_on_.load() ? "on" : "off");
+                           });
     }
 
 public:
@@ -164,6 +215,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
+        InitializeLight();
         InitializeTools();
     }
 
